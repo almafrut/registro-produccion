@@ -341,6 +341,21 @@ select {
 .toast.show { transform: translateX(-50%) translateY(0); }
 .toast.success { background: var(--success); color: #0f1117; }
 .toast.error { background: var(--error); color: #0f1117; }
+.toast.largo { white-space: normal; width: calc(100% - 32px); max-width: 420px; text-align: center; }
+
+/* Aviso de posible duplicado en la confirmacion */
+.aviso-duplicado {
+  display: none;
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--error-bg);
+  color: var(--error);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+.aviso-duplicado.visible { display: block; }
 
 /* Scrollbar */
 ::-webkit-scrollbar { width: 4px; }
@@ -690,6 +705,7 @@ select {
   <div class="modal">
     <h3>Confirmar envío</h3>
     <div class="summary" id="modalSummary"></div>
+    <div class="aviso-duplicado" id="avisoDuplicado"></div>
     <div class="modal-actions">
       <button class="btn-cancel" onclick="closeModal()">Cancelar</button>
       <button class="btn-confirm" onclick="confirmSubmit()">Confirmar</button>
@@ -999,7 +1015,67 @@ function showConfirmModal() {
   summary += `<strong>Horas Extra:</strong> ${data.horasExtra}`;
   
   document.getElementById('modalSummary').innerHTML = summary;
+
+  // Aviso si este mismo registro ya se mando antes (evita duplicados por reenvio)
+  const aviso = document.getElementById('avisoDuplicado');
+  const previo = buscarEnvioPrevio(firmaRegistro(data));
+  if (previo) {
+    const hora = new Date(previo.t).toLocaleTimeString('es-ES', { hour: '2-digit', minute: '2-digit' });
+    aviso.textContent = previo.estado === 'ok'
+      ? `Este registro ya se guardó a las ${hora}. Si lo envías otra vez quedará repetido.`
+      : `Este registro ya se intentó enviar a las ${hora} y puede que se guardara. Compruébalo con el encargado antes de repetirlo.`;
+    aviso.classList.add('visible');
+  } else {
+    aviso.textContent = '';
+    aviso.classList.remove('visible');
+  }
+
   document.getElementById('modalOverlay').classList.add('open');
+}
+
+// ============================================================
+// CONTROL DE DUPLICADOS
+// Cada registro lleva un idEnvio unico. Si el envio falla, el reintento
+// usa el mismo idEnvio para que en el Excel se pueda quitar la copia.
+// ============================================================
+const CLAVE_ENVIOS = 'registroProduccion.envios';
+const HORAS_MEMORIA = 24;
+let envioPendiente = null; // { id, firma } del ultimo envio sin confirmar
+let enviando = false;
+
+function firmaRegistro(d) {
+  return [d.fecha, d.horaInicio, d.horaFin, d.operario, d.trabajo, d.maquina,
+          d.elemento, d.cantidad, d.baseSaliente, d.baseEntrante].join('|');
+}
+
+function nuevoIdEnvio() {
+  if (window.crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 12);
+}
+
+function leerEnvios() {
+  try {
+    const lista = JSON.parse(localStorage.getItem(CLAVE_ENVIOS) || '[]');
+    const limite = Date.now() - HORAS_MEMORIA * 3600 * 1000;
+    return Array.isArray(lista) ? lista.filter(e => e && e.t > limite) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function guardarEnvio(firma, id, estado) {
+  try {
+    const lista = leerEnvios().filter(e => e.id !== id);
+    lista.push({ firma, id, estado, t: Date.now() });
+    localStorage.setItem(CLAVE_ENVIOS, JSON.stringify(lista.slice(-50)));
+  } catch (e) {
+    // Sin almacenamiento (modo privado): el aviso no estara disponible
+  }
+}
+
+function buscarEnvioPrevio(firma) {
+  const previos = leerEnvios().filter(e => e.firma === firma);
+  return previos.length ? previos[previos.length - 1] : null;
 }
 
 function closeModal() {
@@ -1007,10 +1083,18 @@ function closeModal() {
 }
 
 async function confirmSubmit() {
+  if (enviando) return;
+  enviando = true;
   closeModal();
   const data = getFormData();
+  const firma = firmaRegistro(data);
+  // Reintento del mismo registro tras un fallo: se reutiliza su idEnvio
+  if (!envioPendiente || envioPendiente.firma !== firma) {
+    envioPendiente = { id: nuevoIdEnvio(), firma };
+  }
+  data.idEnvio = envioPendiente.id;
   const btn = document.getElementById('btnSubmit');
-  
+
   btn.disabled = true;
   btn.textContent = 'Enviando...';
   
@@ -1034,6 +1118,8 @@ async function confirmSubmit() {
       });
       
       if (response.ok) {
+        guardarEnvio(firma, data.idEnvio, 'ok');
+        envioPendiente = null;
         showToast('✓ Registro guardado correctamente', 'success');
         resetForm();
       } else {
@@ -1041,12 +1127,15 @@ async function confirmSubmit() {
       }
     }
   } catch (err) {
-    showToast('Error al enviar. Inténtalo de nuevo.', 'error');
+    // El flujo puede haber guardado la fila aunque no haya contestado bien
+    guardarEnvio(firma, data.idEnvio, 'dudoso');
+    showToast('No se ha podido confirmar el envío. Puede que ya esté guardado: avisa al encargado antes de repetirlo.', 'error', 8000);
     console.error(err);
   }
-  
+
   btn.disabled = false;
   btn.textContent = 'Enviar Registro';
+  enviando = false;
 }
 
 function resetForm() {
@@ -1085,12 +1174,14 @@ function resetForm() {
 // ============================================================
 // TOAST
 // ============================================================
-function showToast(msg, type) {
+let toastTimer = null;
+function showToast(msg, type, duracion = 3000) {
   const toast = document.getElementById('toast');
   toast.textContent = msg;
-  toast.className = `toast ${type}`;
+  toast.className = `toast ${type}${msg.length > 40 ? ' largo' : ''}`;
   requestAnimationFrame(() => toast.classList.add('show'));
-  setTimeout(() => toast.classList.remove('show'), 3000);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.remove('show'), duracion);
 }
 
 // ============================================================
